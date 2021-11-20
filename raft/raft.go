@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 )
@@ -158,6 +157,9 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// 随机选举超时时间,防止选票无限瓜分,导致死锁
+	randomElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -171,11 +173,12 @@ func newRaft(c *Config) *Raft {
 	peers := c.peers
 
 	raft := &Raft{
-		id:               c.ID,
-		RaftLog:          raftLog,
-		Prs:              make(map[uint64]*Progress),
-		heartbeatTimeout: c.HeartbeatTick,
-		electionTimeout:  c.ElectionTick + rand.Intn(300), // 增加随机时间,防止死锁
+		id:                    c.ID,
+		RaftLog:               raftLog,
+		Prs:                   make(map[uint64]*Progress),
+		heartbeatTimeout:      c.HeartbeatTick,
+		electionTimeout:       c.ElectionTick,
+		randomElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 	}
 
 	for _, p := range peers {
@@ -183,6 +186,17 @@ func newRaft(c *Config) *Raft {
 	}
 
 	return raft
+}
+
+// sendMsgVote 用来发送请求投票的消息
+func (r *Raft) sendMsgRequestVote(to uint64) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVote,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -195,11 +209,44 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	switch r.State {
+	// 对于leader,需要通过心跳维持领导地位
+	case StateLeader:
+		r.heartbeatElapsed++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			msg := pb.Message{
+				MsgType: pb.MessageType_MsgBeat,
+				From:    r.id,
+				Term:    r.Term,
+			}
+			r.Step(msg)
+		}
+	// 对于follower和candidate需要检查electionElapse来决定是否需要选举
+	case StateFollower, StateCandidate:
+		r.electionElapsed++
+		if r.electionElapsed >= r.randomElectionTimeout {
+			r.electionElapsed = 0
+			msg := pb.Message{
+				MsgType: pb.MessageType_MsgHup,
+				From:    r.id,
+				Term:    r.Term,
+			}
+			r.Step(msg)
+		}
+	}
 }
 
 func (r *Raft) reset(term uint64) {
@@ -209,7 +256,8 @@ func (r *Raft) reset(term uint64) {
 	r.Term = term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-	r.electionTimeout = r.electionTimeout + rand.Intn(300)
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+
 	r.votes = make(map[uint64]bool)
 }
 
@@ -227,7 +275,9 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	r.reset(r.Term + 1)
 
+	// 自己给自己投票
 	r.Vote = r.id
+	r.votes[r.id] = true
 	r.State = StateCandidate
 }
 
@@ -244,6 +294,10 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+	}
+
 	switch r.State {
 	case StateFollower:
 		stepFollower(r, m)
@@ -285,16 +339,17 @@ func stepFollower(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	// 准备选举
 	case pb.MessageType_MsgHup:
+		// 若只有自己这一个节点,直接成为leader
+		if len(r.Prs) == 1 {
+			r.becomeCandidate()
+			r.becomeLeader()
+			break
+		}
+
 		r.becomeCandidate()
 		for p := range r.Prs {
 			if p != r.id {
-				msg := pb.Message{
-					MsgType: pb.MessageType_MsgRequestVote,
-					To:      p,
-					From:    r.id,
-					Term:    r.Term,
-					Index:   r.RaftLog.LastIndex()}
-				r.msgs = append(r.msgs, msg)
+				r.sendMsgRequestVote(p)
 			}
 		}
 	case pb.MessageType_MsgHeartbeat:
@@ -308,7 +363,7 @@ func stepFollower(r *Raft, m pb.Message) {
 			Term:    r.Term,
 			Reject:  true,
 		}
-		if r.Vote == None || m.Term > r.Term {
+		if r.Vote == None || r.Vote == m.From || m.Term > r.Term {
 			//fmt.Println("id: ", r.id, " from: ", m.From)
 			r.Vote = m.From
 			msg.Reject = false
@@ -318,6 +373,13 @@ func stepFollower(r *Raft, m pb.Message) {
 }
 func stepCandidate(r *Raft, m pb.Message) {
 	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.becomeCandidate()
+		for p := range r.Prs {
+			if p != r.id {
+				r.sendMsgRequestVote(p)
+			}
+		}
 	// 收到append,说明集群中已有了leader
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
@@ -333,11 +395,24 @@ func stepCandidate(r *Raft, m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		r.handleSnapshot(m)
 
+	case pb.MessageType_MsgRequestVote:
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		if r.Vote == None || m.Term > r.Term {
+			//fmt.Println("id: ", r.id, " from: ", m.From)
+			r.Vote = m.From
+			msg.Reject = false
+		}
+		r.msgs = append(r.msgs, msg)
+
 	// 计算自己的票数
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.votes[m.From] = !m.Reject
-		// 自己给自己投票
-		r.votes[r.id] = true
 		agree, reject := 0, 0
 		for _, v := range r.votes {
 			if v {
@@ -346,12 +421,14 @@ func stepCandidate(r *Raft, m pb.Message) {
 				reject += 1
 			}
 		}
-		fmt.Println("id:", r.id, "agree:", agree)
+		//fmt.Println("id:", r.id, "agree:", agree)
 		// 获得多数的投票,进化为leader
 		if agree > len(r.Prs)/2 {
 			r.becomeLeader()
 			for p := range r.Prs {
-				r.sendHeartbeat(p)
+				if p != r.id {
+					r.sendHeartbeat(p)
+				}
 			}
 		} else if reject > len(r.Prs)/2 { // 若大多数节点拒绝,则退化为follower
 			r.becomeFollower(m.Term, None)
@@ -363,12 +440,31 @@ func stepLeader(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		for p := range r.Prs {
-			r.sendHeartbeat(p)
+			if p != r.id {
+				r.sendHeartbeat(p)
+			}
 		}
 
 	case pb.MessageType_MsgPropose:
 		for p := range r.Prs {
-			r.sendAppend(p)
+			if p != r.id {
+				r.sendAppend(p)
+			}
 		}
+
+	case pb.MessageType_MsgRequestVote:
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		if r.Vote == None || m.Term > r.Term {
+			//fmt.Println("id: ", r.id, " from: ", m.From)
+			r.Vote = m.From
+			msg.Reject = false
+		}
+		r.msgs = append(r.msgs, msg)
 	}
 }
