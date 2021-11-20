@@ -69,9 +69,8 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	limit := req.Limit
 
 	iter := reader.IterCF(req.Cf)
-	iter.Seek(req.StartKey)
 
-	for ; iter.Valid(); iter.Next() {
+	for iter.Seek(req.StartKey); iter.Valid(); iter.Next() {
 		key := iter.Item().Key()
 		value, _ := iter.Item().Value()
 		kvPairs = append(kvPairs, &kvrpcpb.KvPair{Key: key, Value: value})

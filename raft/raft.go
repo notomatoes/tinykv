@@ -16,8 +16,9 @@ package raft
 
 import (
 	"errors"
-
+	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -165,7 +166,23 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	raftLog := newLog(c.Storage)
+	// 配置节点
+	peers := c.peers
+
+	raft := &Raft{
+		id:               c.ID,
+		RaftLog:          raftLog,
+		Prs:              make(map[uint64]*Progress),
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick + rand.Intn(300), // 增加随机时间,防止死锁
+	}
+
+	for _, p := range peers {
+		raft.Prs[p] = &Progress{Next: 1}
+	}
+
+	return raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -185,20 +202,42 @@ func (r *Raft) tick() {
 	// Your Code Here (2A).
 }
 
+func (r *Raft) reset(term uint64) {
+	r.Lead = None
+	r.Vote = None
+
+	r.Term = term
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.electionTimeout = r.electionTimeout + rand.Intn(300)
+	r.votes = make(map[uint64]bool)
+}
+
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.reset(term)
+
+	r.Lead = lead
+	r.State = StateFollower
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.reset(r.Term + 1)
+
+	r.Vote = r.id
+	r.State = StateCandidate
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.reset(r.Term)
+	r.Lead = r.id
+	r.State = StateLeader
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -207,8 +246,11 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		stepFollower(r, m)
 	case StateCandidate:
+		stepCandidate(r, m)
 	case StateLeader:
+		stepLeader(r, m)
 	}
 	return nil
 }
@@ -236,4 +278,97 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// steps
+func stepFollower(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	// 准备选举
+	case pb.MessageType_MsgHup:
+		r.becomeCandidate()
+		for p := range r.Prs {
+			if p != r.id {
+				msg := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVote,
+					To:      p,
+					From:    r.id,
+					Term:    r.Term,
+					Index:   r.RaftLog.LastIndex()}
+				r.msgs = append(r.msgs, msg)
+			}
+		}
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+
+	case pb.MessageType_MsgRequestVote:
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		if r.Vote == None || m.Term > r.Term {
+			//fmt.Println("id: ", r.id, " from: ", m.From)
+			r.Vote = m.From
+			msg.Reject = false
+		}
+		r.msgs = append(r.msgs, msg)
+	}
+}
+func stepCandidate(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	// 收到append,说明集群中已有了leader
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+
+	// 收到heartbeat,说明集群中已有了leader
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
+
+	// 收到snapshot,说明集群中已有了leader
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
+
+	// 计算自己的票数
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.votes[m.From] = !m.Reject
+		// 自己给自己投票
+		r.votes[r.id] = true
+		agree, reject := 0, 0
+		for _, v := range r.votes {
+			if v {
+				agree += 1
+			} else {
+				reject += 1
+			}
+		}
+		fmt.Println("id:", r.id, "agree:", agree)
+		// 获得多数的投票,进化为leader
+		if agree > len(r.Prs)/2 {
+			r.becomeLeader()
+			for p := range r.Prs {
+				r.sendHeartbeat(p)
+			}
+		} else if reject > len(r.Prs)/2 { // 若大多数节点拒绝,则退化为follower
+			r.becomeFollower(m.Term, None)
+		}
+	}
+}
+
+func stepLeader(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		for p := range r.Prs {
+			r.sendHeartbeat(p)
+		}
+
+	case pb.MessageType_MsgPropose:
+		for p := range r.Prs {
+			r.sendAppend(p)
+		}
+	}
 }
