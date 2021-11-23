@@ -329,14 +329,16 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.reset(r.Term)
 	r.Lead = r.id
+	r.Vote = r.id
+	r.votes[r.id] = true
 	r.State = StateLeader
 
 	// 初始化follower的Progress
 	last := r.RaftLog.LastIndex()
 	for p := range r.Prs {
 		if p == r.id {
-			r.Prs[p].Match = last
-			r.Prs[p].Next = last + 1
+			r.Prs[p].Match = last + 1
+			r.Prs[p].Next = last + 2
 		} else {
 			r.Prs[p].Match = 0
 			r.Prs[p].Next = last + 1
@@ -476,6 +478,8 @@ func stepFollower(r *Raft, m pb.Message) {
 		if len(r.Prs) == 1 {
 			r.becomeCandidate()
 			r.becomeLeader()
+			r.RaftLog.committed = r.Prs[r.id].Match
+
 			break
 		}
 
@@ -679,4 +683,19 @@ func (l *RaftLog) GetEntries(lo uint64, hi uint64) []pb.Entry {
 		return l.entries[lo-l.first : hi-l.first+1]
 	}
 	return nil
+}
+
+func (r *Raft) SoftState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) HardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }
