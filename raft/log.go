@@ -14,7 +14,9 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -50,13 +52,28 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+
+	// 日志中第一个条目的索引,即快照条目与日志分界线
+	first uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	log := &RaftLog{storage: storage}
+	hardState, _, _ := storage.InitialState()
+	first, _ := storage.FirstIndex()
+	last, _ := storage.LastIndex()
+	entries, _ := storage.Entries(first, last+1)
+
+	log := &RaftLog{
+		storage:   storage,
+		committed: hardState.Commit,
+		applied:   first - 1,
+		stabled:   last,
+		entries:   entries,
+		first:     first,
+	}
 
 	return log
 }
@@ -71,23 +88,85 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	if len(l.entries) > 0 && l.LastIndex() > l.stabled {
+		return l.entries[l.stabled:]
+	}
+	return make([]pb.Entry, 0)
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	if len(l.entries) > 0 {
+		return l.entries[l.applied-l.first+1 : l.committed-l.first+1]
+	}
+	return
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+
+	// 若entries存在,则返回entries中的lastIndex
+	if len(l.entries) != 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	// 若entries不存在,则返回storage中的lastIndex
+	idx, _ := l.storage.LastIndex()
+
+	return idx
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+
+	if i > l.LastIndex() {
+		return 0, ErrUnavailable
+	}
+	if len(l.entries) > 0 && i >= l.first {
+		return l.entries[i-l.first].Term, nil
+	}
+	return l.storage.Term(i)
+}
+
+// 添加数据到RaftLog中,返回最后一条日志的索引
+func (l *RaftLog) append(ents ...pb.Entry) uint64 {
+	if len(ents) == 0 {
+		return l.LastIndex()
+	}
+	// 若索引小于committed,则数据非法
+	if k := ents[0].Index - 1; k < l.committed {
+		//fmt.Sprintf("append Error,entrie's index(%d) must <= committed(%d).\n", k, l.committed)
+		return 0
+	}
+	k := ents[0].Index
+	switch {
+	// 若正好紧接着当前数据,则直接append
+	case k == l.first+uint64(len(l.entries)):
+		l.entries = append(l.entries, ents...)
+	// 若比当前entries的起始位置小,则需要用新数据替换旧数据,并更改first和entries
+	case k <= l.first:
+		l.first = k
+		l.entries = ents
+	// 默认情况,则说明l.first < k < l.first + uint64(len(l.entries)),则需要拼接
+	default:
+		l.entries = append([]pb.Entry{}, l.entries[0:k-1]...)
+		l.entries = append(l.entries, ents...)
+	}
+
+	// 若更改了stabled之前的数据,则更新stabled
+	if l.stabled >= k {
+		l.stabled = k - 1
+	}
+
+	return l.LastIndex()
+}
+
+// 判断是否比当前节点的日志更新：1）term是否更大 2）term相同的情况下，索引是否更大
+func (l *RaftLog) isUpToDate(lastI, term uint64) bool {
+	lastIdx := l.LastIndex()
+	lastTerm, _ := l.Term(lastIdx)
+
+	return term > lastTerm || (term == lastTerm && lastI >= lastIdx)
 }
